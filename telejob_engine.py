@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Telejob Auto Ad Engine v3.1.0 (원격 OTA 핫스왑 엔진 + 3색 A/B/C 자동 로테이션 + 메모리 누수 0%)
+Telejob Auto Ad Engine v3.2.0
+- 중복 실행 완벽 차단 (Windows Named Mutex: 무조건 창 1개만 유지, 중복 클릭 시 기존 창 활성화)
+- [🌐 텔레잡 실제 등록 확인] 버튼 + 공고 목록 더블클릭 시 해당 공고 상세페이지 즉시 오픈
+- 윈도우 부팅 시 자동 실행 ON/OFF 체크박스
+- 3색 A/B/C(제목/부제목/키워드) 자동 로테이션 + 디자인 1개 고정 + 원격 OTA
+- 크롬 미사용 순수 HTTP Direct 엔진 (메모리 누수 0%)
 """
 
 import os
@@ -10,19 +15,28 @@ import re
 import json
 import time
 import uuid
+import ctypes
+import winreg
 import mimetypes
 import datetime
 import threading
 import subprocess
+import webbrowser
 import urllib.request
 import urllib.parse
 import http.cookiejar
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 
-ENGINE_VERSION = "3.1.0"
+ENGINE_VERSION = "3.2.0"
+WINDOW_TITLE = f"텔레잡 자동 광고 등록/관리 모니터 v{ENGINE_VERSION} (3색 A/B/C 로테이션 & 원격 OTA)"
+MUTEX_NAME = "Global\\TelejobAutoAd_SingleInstance_Mutex_v3"
 OTA_VERSION_URL = "https://raw.githubusercontent.com/rst9374-tech/telejob_auto_updater/main/version.json"
 OTA_ENGINE_URL = "https://raw.githubusercontent.com/rst9374-tech/telejob_auto_updater/main/telejob_engine.py"
+TELEJOB_PUBLIC_LIST_URL = "https://www.telejob.co.kr/pages/job/list"
+TELEJOB_POST_VIEW_URL = "https://www.telejob.co.kr/pages/job/view?wiSeq="
+RUN_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_REG_NAME = "TelejobAutoAd"
 
 if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(sys.executable)
@@ -32,11 +46,33 @@ else:
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 VERSION_PATH = os.path.join(BASE_DIR, "version.json")
 ENGINE_PATH = os.path.join(BASE_DIR, "telejob_engine.py")
+EXE_PATH = os.path.join(BASE_DIR, "TelejobAutoAd.exe")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 DESIGN_DIR = os.path.join(BASE_DIR, "designs")
 
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(DESIGN_DIR, exist_ok=True)
+
+_mutex_handle = None
+
+
+def acquire_single_instance_lock():
+    """이미 실행 중인 창이 있으면 그 창을 앞으로 띄우고 현재 프로세스는 즉시 종료"""
+    global _mutex_handle
+    if "--restart" in sys.argv:
+        time.sleep(1.2)
+    kernel32 = ctypes.windll.kernel32
+    user32 = ctypes.windll.user32
+    _mutex_handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
+    last_err = kernel32.GetLastError()
+    if last_err == 183:  # ERROR_ALREADY_EXISTS
+        # 기존 창 찾아서 앞으로 활성화
+        hwnd = user32.FindWindowW(None, WINDOW_TITLE)
+        if hwnd:
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            user32.SetForegroundWindow(hwnd)
+        os._exit(0)
+
 
 DEFAULT_PRESETS = [
     {
@@ -66,12 +102,38 @@ DEFAULT_CONFIG = {
     "start_hour": 4,
     "end_hour": 24,
     "auto_start": True,
+    "windows_startup": True,
     "use_abc_rotation": True,
     "use_design_rotation": False,
     "auto_ota_update": True,
     "last_preset_index": 0,
     "presets": DEFAULT_PRESETS
 }
+
+
+def is_windows_startup_enabled():
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_REG_PATH, 0, winreg.KEY_READ) as key:
+            val, _ = winreg.QueryValueEx(key, RUN_REG_NAME)
+            return bool(val)
+    except Exception:
+        return False
+
+
+def set_windows_startup(enable=True):
+    try:
+        target = f'"{EXE_PATH}"' if os.path.exists(EXE_PATH) else f'"{sys.executable}" "{os.path.join(BASE_DIR, "telejob_auto_ad.py")}"'
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_REG_PATH, 0, winreg.KEY_SET_VALUE) as key:
+            if enable:
+                winreg.SetValueEx(key, RUN_REG_NAME, 0, winreg.REG_SZ, target)
+            else:
+                try:
+                    winreg.DeleteValue(key, RUN_REG_NAME)
+                except FileNotFoundError:
+                    pass
+        return True
+    except Exception:
+        return False
 
 
 def load_config():
@@ -99,12 +161,11 @@ def save_config(cfg):
 
 
 def check_and_download_ota():
-    """원격 GitHub 저장소에서 최신 버전 확인 및 다운로드 (업데이트 발생 시 (True, new_ver, notes) 반환)"""
     try:
         ts = int(time.time())
         req = urllib.request.Request(
             f"{OTA_VERSION_URL}?t={ts}",
-            headers={"User-Agent": "TelejobAutoAd-OTA/3.1", "Cache-Control": "no-cache"}
+            headers={"User-Agent": "TelejobAutoAd-OTA/3.2", "Cache-Control": "no-cache"}
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             remote_info = json.loads(resp.read().decode("utf-8"))
@@ -113,17 +174,15 @@ def check_and_download_ota():
         if not remote_ver or remote_ver == ENGINE_VERSION:
             return False, ENGINE_VERSION, "최신 버전입니다."
 
-        # 버전 비교
         def _ver_tuple(v):
             return tuple(int(x) for x in re.findall(r"\d+", v))
 
         if _ver_tuple(remote_ver) <= _ver_tuple(ENGINE_VERSION):
             return False, ENGINE_VERSION, "최신 버전입니다."
 
-        # 새 엔진 파일 다운로드
         req_eng = urllib.request.Request(
             f"{OTA_ENGINE_URL}?t={ts}",
-            headers={"User-Agent": "TelejobAutoAd-OTA/3.1", "Cache-Control": "no-cache"}
+            headers={"User-Agent": "TelejobAutoAd-OTA/3.2", "Cache-Control": "no-cache"}
         )
         with urllib.request.urlopen(req_eng, timeout=15) as resp:
             new_code = resp.read().decode("utf-8")
@@ -145,10 +204,6 @@ def check_and_download_ota():
 
 
 class TelejobClient:
-    """
-    1회 사이클마다 생성되고 즉시 소멸되는 무상태(Stateless) HTTP 클라이언트.
-    브라우저를 띄우지 않아 크롬 좀비 프로세스나 메모리 누수가 원천적으로 0%입니다.
-    """
     BASE_URL = "https://www.telejob.co.kr"
 
     def __init__(self, timeout=30):
@@ -419,12 +474,15 @@ class TelejobClient:
 class TelejobApp:
     def __init__(self, root):
         self.root = root
-        self.root.title(f"텔레잡 자동 광고 등록/관리 모니터 v{ENGINE_VERSION} (3색 A/B/C 로테이션 & 원격 OTA)")
-        self.root.geometry("960x760")
-        self.root.minsize(900, 700)
+        self.root.title(WINDOW_TITLE)
+        self.root.geometry("1040x780")
+        self.root.minsize(980, 720)
         self.root.configure(bg="#111827")
 
         self.cfg = load_config()
+        if self.cfg.get("windows_startup", True):
+            set_windows_startup(True)
+
         self.is_running = False
         self.is_working = False
         self.next_run_timestamp = None
@@ -432,7 +490,7 @@ class TelejobApp:
         self.fail_count = 0
 
         self._build_ui()
-        self.log(f"프로그램 시작 완료 (버전: v{ENGINE_VERSION} | 크롬 미사용 HTTP Direct 엔진 | 메모리 누수 0%)")
+        self.log(f"프로그램 시작 완료 (v{ENGINE_VERSION} | 중복실행 방지 락 ON | 윈도우 자동실행: {'ON' if is_windows_startup_enabled() else 'OFF'})")
 
         threading.Thread(target=self.fetch_current_status_only, daemon=True).start()
 
@@ -445,32 +503,39 @@ class TelejobApp:
         style = ttk.Style()
         style.theme_use("clam")
 
-        header = tk.Frame(self.root, bg="#1F2937", padx=16, pady=10)
+        # 1. 상단 상태 요약 헤더
+        header = tk.Frame(self.root, bg="#1F2937", padx=14, pady=10)
         header.pack(fill="x", padx=12, pady=(10, 4))
 
         self.status_badge = tk.Label(
-            header, text="● 대기 중", font=("맑은 고딕", 13, "bold"),
+            header, text="● 대기 중", font=("맑은 고딕", 12, "bold"),
             fg="#10B981", bg="#1F2937"
         )
         self.status_badge.pack(side="left")
 
         self.countdown_label = tk.Label(
-            header, text="다음 실행 대기: --:--", font=("맑은 고딕", 12, "bold"),
+            header, text="다음 실행까지: --:--", font=("맑은 고딕", 11, "bold"),
             fg="#60A5FA", bg="#1F2937"
         )
-        self.countdown_label.pack(side="left", padx=20)
+        self.countdown_label.pack(side="left", padx=16)
+
+        self.stats_label = tk.Label(
+            header, text="누적 성공: 0회 | 실패: 0회 | 메모리: 정상(0%)",
+            font=("맑은 고딕", 9, "bold"), fg="#D1D5DB", bg="#1F2937"
+        )
+        self.stats_label.pack(side="left", padx=8)
 
         tk.Button(
             header, text=f"☁️ 원격 업데이트 확인 (v{ENGINE_VERSION})", command=self.manual_ota_check,
             bg="#374151", fg="#93C5FD", font=("맑은 고딕", 9, "bold"), relief="flat", padx=10, pady=3
-        ).pack(side="right", padx=(10, 0))
+        ).pack(side="right", padx=(6, 0))
 
-        self.stats_label = tk.Label(
-            header, text="누적 성공: 0회  |  실패: 0회  |  메모리: 정상(누수 0%)",
-            font=("맑은 고딕", 10), fg="#D1D5DB", bg="#1F2937"
-        )
-        self.stats_label.pack(side="right")
+        tk.Button(
+            header, text="🌐 텔레잡 실제 등록 확인 (사이트 열기)", command=self.open_public_board,
+            bg="#0284C7", fg="#FFFFFF", font=("맑은 고딕", 9, "bold"), relief="flat", padx=10, pady=3
+        ).pack(side="right", padx=4)
 
+        # 2. 환경 설정 및 제어 패널
         ctrl_frame = tk.LabelFrame(
             self.root, text=" 환경 설정 및 제어 ", font=("맑은 고딕", 10, "bold"),
             fg="#F9FAFB", bg="#1F2937", padx=12, pady=8
@@ -508,19 +573,28 @@ class TelejobApp:
         row2 = tk.Frame(ctrl_frame, bg="#1F2937")
         row2.pack(fill="x", pady=(6, 2))
 
+        self.win_startup_var = tk.BooleanVar(value=is_windows_startup_enabled())
+        tk.Checkbutton(
+            row2, text="PC 켜질 때 자동 실행",
+            variable=self.win_startup_var, command=self.on_save_config,
+            fg="#60A5FA", bg="#1F2937", selectcolor="#111827",
+            activebackground="#1F2937", activeforeground="#60A5FA",
+            font=("맑은 고딕", 9, "bold")
+        ).pack(side="left")
+
         self.abc_rot_var = tk.BooleanVar(value=self.cfg.get("use_abc_rotation", True))
         tk.Checkbutton(
-            row2, text="3색 A/B/C 세트(제목·부제목·키워드) 순차 변경 사용 (디자인은 기존 1개 고정)",
+            row2, text="3색 A/B/C 세트 순차 변경 (디자인 1개 고정)",
             variable=self.abc_rot_var, command=self.on_save_config,
             fg="#34D399", bg="#1F2937", selectcolor="#111827",
             activebackground="#1F2937", activeforeground="#34D399",
             font=("맑은 고딕", 9, "bold")
-        ).pack(side="left")
+        ).pack(side="left", padx=(10, 6))
 
         tk.Button(
             row2, text="🔄 현황 새로고침", command=lambda: threading.Thread(target=self.fetch_current_status_only, daemon=True).start(),
-            bg="#4B5563", fg="#FFFFFF", font=("맑은 고딕", 9), relief="flat", padx=8, pady=3
-        ).pack(side="left", padx=8)
+            bg="#4B5563", fg="#FFFFFF", font=("맑은 고딕", 9), relief="flat", padx=8, pady=4
+        ).pack(side="left", padx=3)
 
         self.toggle_btn = tk.Button(
             row2, text="▶ 자동 반복 시작", command=self.toggle_scheduler,
@@ -535,11 +609,12 @@ class TelejobApp:
         self.run_now_btn.pack(side="right", padx=3)
 
         self.run_all3_btn = tk.Button(
-            row2, text="🚀 3개 공고 모두 A·B·C로 즉시 일괄교체", command=self.run_all_three_now,
+            row2, text="🚀 3개 공고 A·B·C 일괄교체", command=self.run_all_three_now,
             bg="#7C3AED", fg="#FFFFFF", font=("맑은 고딕", 9, "bold"), relief="flat", padx=12, pady=4
         )
         self.run_all3_btn.pack(side="right", padx=3)
 
+        # 3. 3색 A/B/C 자동 로테이션 문구 설정
         preset_frame = tk.LabelFrame(
             self.root, text=" 3색 A/B/C 자동 로테이션 문구 설정 (부제목 14자 / 제목 27자 / 키워드 5개·27자 이내) ",
             font=("맑은 고딕", 10, "bold"), fg="#FBBF24", bg="#1F2937", padx=12, pady=6
@@ -565,16 +640,17 @@ class TelejobApp:
 
             tk.Label(prow, text="제목:", fg="#D1D5DB", bg="#1F2937", font=("맑은 고딕", 9)).pack(side="left")
             title_v = tk.StringVar(value=p.get("title", ""))
-            tk.Entry(prow, textvariable=title_v, width=35, font=("맑은 고딕", 9)).pack(side="left", padx=(2, 8))
+            tk.Entry(prow, textvariable=title_v, width=38, font=("맑은 고딕", 9)).pack(side="left", padx=(2, 8))
 
             tk.Label(prow, text="키워드:", fg="#D1D5DB", bg="#1F2937", font=("맑은 고딕", 9)).pack(side="left")
             kw_v = tk.StringVar(value=p.get("keyword", ""))
-            tk.Entry(prow, textvariable=kw_v, width=30, font=("맑은 고딕", 9)).pack(side="left", padx=(2, 4))
+            tk.Entry(prow, textvariable=kw_v, width=32, font=("맑은 고딕", 9)).pack(side="left", padx=(2, 4))
 
             self.preset_vars.append({"subTitle": sub_v, "title": title_v, "keyword": kw_v})
 
+        # 4. 현재 게재중인 공고 3개 실시간 현황판 (더블클릭 시 해당 공고 웹페이지 오픈)
         board_frame = tk.LabelFrame(
-            self.root, text=" 현재 텔레잡에 게재 중인 실시간 공고 목록 (최대 3건) ",
+            self.root, text=" 현재 텔레잡에 게재 중인 실시간 공고 목록 (줄을 더블클릭하면 실제 등록된 공고 웹페이지가 열립니다) ",
             font=("맑은 고딕", 10, "bold"), fg="#F9FAFB", bg="#1F2937", padx=12, pady=6
         )
         board_frame.pack(fill="x", padx=12, pady=4)
@@ -584,16 +660,18 @@ class TelejobApp:
         self.tree.heading("rank", text="순번")
         self.tree.heading("wiSeq", text="공고번호(wiSeq)")
         self.tree.heading("subTitle", text="부제목")
-        self.tree.heading("title", text="채용공고 제목")
+        self.tree.heading("title", text="채용공고 제목 (더블클릭 시 실제 공고 열기)")
         self.tree.heading("modDate", text="최근 게재/수정일시")
 
         self.tree.column("rank", width=60, anchor="center")
         self.tree.column("wiSeq", width=110, anchor="center")
         self.tree.column("subTitle", width=150, anchor="center")
-        self.tree.column("title", width=390, anchor="w")
-        self.tree.column("modDate", width=160, anchor="center")
+        self.tree.column("title", width=440, anchor="w")
+        self.tree.column("modDate", width=170, anchor="center")
         self.tree.pack(fill="x")
+        self.tree.bind("<Double-1>", self.on_tree_double_click)
 
+        # 5. 하단 실시간 진행 로그 창
         log_frame = tk.LabelFrame(
             self.root, text=" 실시간 진행상황 및 결과 모니터링 로그 ",
             font=("맑은 고딕", 10, "bold"), fg="#F9FAFB", bg="#1F2937", padx=12, pady=6
@@ -605,6 +683,21 @@ class TelejobApp:
             insertbackground="#FFFFFF", relief="flat"
         )
         self.log_box.pack(fill="both", expand=True)
+
+    def open_public_board(self):
+        self.log(f"브라우저에서 텔레잡 전체 채용정보 게시판({TELEJOB_PUBLIC_LIST_URL})을 엽니다...")
+        webbrowser.open(TELEJOB_PUBLIC_LIST_URL)
+
+    def on_tree_double_click(self, event):
+        selected = self.tree.selection()
+        if not selected:
+            return
+        vals = self.tree.item(selected[0], "values")
+        if vals and len(vals) >= 2:
+            wi_seq = vals[1]
+            url = f"{TELEJOB_POST_VIEW_URL}{wi_seq}"
+            self.log(f"브라우저에서 실제 등록 공고(wiSeq={wi_seq}) 상세페이지를 엽니다: {url}")
+            webbrowser.open(url)
 
     def log(self, msg):
         now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -631,8 +724,8 @@ class TelejobApp:
             self.log("원격 업데이트 서버(GitHub OTA)에서 최신 버전을 확인합니다...")
             updated, ver, notes = check_and_download_ota()
             if updated:
-                self.log(f"★ 새 버전(v{ver}) 다운로드 완료! ({notes}) -> 2초 후 자동 재시작합니다.")
-                time.sleep(2)
+                self.log(f"★ 새 버전(v{ver}) 다운로드 완료! ({notes}) -> 1초 후 자동 재시작합니다.")
+                time.sleep(1)
                 self._restart_self()
             else:
                 self.log(f"원격 업데이트 확인 결과: 현재 최신 버전(v{ENGINE_VERSION}) 사용 중 ({notes})")
@@ -641,8 +734,12 @@ class TelejobApp:
 
     def _restart_self(self):
         def _do():
+            global _mutex_handle
+            if _mutex_handle:
+                ctypes.windll.kernel32.CloseHandle(_mutex_handle)
+                _mutex_handle = None
             self.root.destroy()
-            subprocess.Popen([sys.executable] + sys.argv, cwd=BASE_DIR)
+            subprocess.Popen([sys.executable] + sys.argv + ["--restart"], cwd=BASE_DIR)
             os._exit(0)
         self.root.after(0, _do)
 
@@ -661,6 +758,8 @@ class TelejobApp:
         self.cfg["start_hour"] = sh
         self.cfg["end_hour"] = eh
         self.cfg["use_abc_rotation"] = bool(self.abc_rot_var.get())
+        self.cfg["windows_startup"] = bool(self.win_startup_var.get())
+        set_windows_startup(self.cfg["windows_startup"])
 
         new_presets = []
         for i, pv in enumerate(self.preset_vars):
@@ -673,7 +772,9 @@ class TelejobApp:
         self.cfg["presets"] = new_presets
 
         save_config(self.cfg)
-        self.log(f"설정 저장 완료: 주기 {interval}분 | 3색 A/B/C 로테이션={'ON' if self.cfg['use_abc_rotation'] else 'OFF'}")
+        self.log(
+            f"설정 저장 완료: 주기 {interval}분 | PC 켜질 때 자동실행={'ON' if self.cfg['windows_startup'] else 'OFF'} | 3색 로테이션={'ON' if self.cfg['use_abc_rotation'] else 'OFF'}"
+        )
 
     def update_table(self, posts):
         def _update():
@@ -762,12 +863,11 @@ class TelejobApp:
         self.is_working = True
         self.root.after(0, lambda: self.status_badge.config(text="● 광고 작업 실행 중...", fg="#3B82F6"))
 
-        # 매 주기 작업 전 원격 OTA 자동 체크
         if self.cfg.get("auto_ota_update", True):
             updated, ver, notes = check_and_download_ota()
             if updated:
                 self.log(f"★ 원격 새 버전(v{ver}) 감지 및 업데이트 완료! ({notes}) 재시작합니다...")
-                time.sleep(1.5)
+                time.sleep(1.0)
                 self._restart_self()
                 return
 
@@ -847,7 +947,7 @@ class TelejobApp:
         else:
             self.status_badge.config(text="● 일시 정지됨", fg="#F59E0B")
         self.stats_label.config(
-            text=f"누적 성공: {self.success_count}회  |  실패: {self.fail_count}회  |  메모리: 정상(누수 0%)"
+            text=f"누적 성공: {self.success_count}회 | 실패: {self.fail_count}회 | 메모리: 정상(0%)"
         )
 
     def _tick_timer(self):
@@ -869,6 +969,7 @@ class TelejobApp:
 
 
 def main():
+    acquire_single_instance_lock()
     root = tk.Tk()
     app = TelejobApp(root)
     root.mainloop()
